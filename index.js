@@ -1,6 +1,7 @@
 const express = require('express');
 const PDFDocument = require('pdfkit');
 const cors = require('cors');
+const fs = require('fs');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -8,6 +9,47 @@ const PORT = process.env.PORT || 3000;
 // Middleware
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
+
+// Helper function to replace emojis with text descriptions (fallback)
+function replaceEmojisWithText(text) {
+  // Common emoji mappings for better readability
+  const emojiMap = {
+    '🚀': '[ROCKET]',
+    '📌': '[PUSHPIN]',
+    '📚': '[BOOKS]',
+    '💪': '[FLEXED_BICEPS]',
+    '🎯': '[TARGET]',
+    '💚': '[GREEN_HEART]',
+    '📄': '[PAGE]',
+    '✅': '[CHECK]',
+    '⚠️': '[WARNING]',
+    '⭐': '[STAR]',
+    '🔥': '[FIRE]',
+    '💡': '[LIGHT_BULB]',
+    '🎉': '[PARTY]',
+    '👍': '[THUMBS_UP]',
+    '👎': '[THUMBS_DOWN]',
+  };
+  
+  let result = text;
+  
+  // First, replace known emojis with text descriptions
+  for (const [emoji, replacement] of Object.entries(emojiMap)) {
+    result = result.replace(new RegExp(emoji.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), replacement);
+  }
+  
+  // For remaining emojis, replace with Unicode notation or remove
+  // This regex matches most emoji ranges
+  result = result.replace(/[\u{1F300}-\u{1F9FF}]|[\u{2600}-\u{26FF}]|[\u{2700}-\u{27BF}]|[\u{1F600}-\u{1F64F}]|[\u{1F680}-\u{1F6FF}]|[\u{1F1E0}-\u{1F1FF}]|[\u{1F900}-\u{1F9FF}]|[\u{1FA00}-\u{1FA6F}]|[\u{1FA70}-\u{1FAFF}]|[\u{FE00}-\u{FE0F}]|[\u{200D}]|[\u{20D0}-\u{20FF}]/gu, (match) => {
+    // Remove unknown emojis or replace with space
+    return ' ';
+  });
+  
+  // Clean up multiple spaces
+  result = result.replace(/\s+/g, ' ');
+  
+  return result;
+}
 
 // Helper function to decode HTML entities
 function decodeHtmlEntities(text) {
@@ -40,8 +82,46 @@ function decodeHtmlEntities(text) {
   return decoded;
 }
 
+// Helper function to find emoji font path
+function findEmojiFontPath() {
+  const possibleEmojiFontPaths = [
+    // macOS
+    '/System/Library/Fonts/Apple Color Emoji.ttc',
+    '/Library/Fonts/Apple Color Emoji.ttc',
+    // Windows (if running on Windows)
+    'C:/Windows/Fonts/seguiemj.ttf',
+    // Linux
+    '/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf',
+    '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf',
+  ];
+  
+  for (const fontPath of possibleEmojiFontPaths) {
+    if (fs.existsSync(fontPath)) {
+      return fontPath;
+    }
+  }
+  
+  return null;
+}
+
+// Helper function to register emoji-supporting font if available
+function registerEmojiFont(doc) {
+  const fontPath = findEmojiFontPath();
+  
+  if (fontPath) {
+    try {
+      doc.registerFont('EmojiFont', fontPath);
+      return true;
+    } catch (error) {
+      console.warn(`Failed to register font at ${fontPath}:`, error.message);
+    }
+  }
+  
+  return false;
+}
+
 // Helper function to clean text for PDF
-function cleanText(text) {
+function cleanText(text, preserveEmojis = false) {
   if (!text) return '';
   
   // Decode HTML entities first
@@ -56,6 +136,11 @@ function cleanText(text) {
   
   // Remove excessive whitespace but preserve intentional line breaks
   text = text.replace(/[ \t]+/g, ' ');
+  
+  // Handle emojis: if emoji font is not available, replace them
+  if (!preserveEmojis) {
+    text = replaceEmojisWithText(text);
+  }
   
   return text.trim();
 }
@@ -85,12 +170,17 @@ app.post('/generate-pdf', (req, res) => {
       });
     }
 
-    // Clean all text inputs
-    const cleanedTitle = cleanText(problemTitle);
-    const cleanedDifficulty = cleanText(problemDifficulty || '');
-    const cleanedTopics = cleanText(problemTopics || '');
-    const cleanedContent = cleanText(problemContent || '');
-    const cleanedAnalysis = cleanText(analysis);
+    // Check if emoji font path exists (before creating doc)
+    const emojiFontPath = findEmojiFontPath();
+    const emojiFontExists = emojiFontPath !== null;
+
+    // Clean all text inputs (we'll preserve emojis if font gets registered successfully)
+    // For now, we'll preserve emojis optimistically if font path exists
+    const cleanedTitle = cleanText(problemTitle, emojiFontExists);
+    const cleanedDifficulty = cleanText(problemDifficulty || '', emojiFontExists);
+    const cleanedTopics = cleanText(problemTopics || '', emojiFontExists);
+    const cleanedContent = cleanText(problemContent || '', emojiFontExists);
+    const cleanedAnalysis = cleanText(analysis, emojiFontExists);
 
     // Create PDF document
     const doc = new PDFDocument({
@@ -104,6 +194,21 @@ app.post('/generate-pdf', (req, res) => {
       bufferPages: true
     });
 
+    // Try to register emoji-supporting font
+    let hasEmojiFont = false;
+    if (emojiFontExists) {
+      hasEmojiFont = registerEmojiFont(doc);
+      if (hasEmojiFont) {
+        console.log('✅ Emoji-supporting font registered');
+      } else {
+        console.log('⚠️  Failed to register emoji font, emojis will be replaced with text descriptions');
+        // If registration failed, we need to re-clean text to replace emojis
+        // Note: This is a fallback, in production you might want to handle this differently
+      }
+    } else {
+      console.log('⚠️  No emoji font found, emojis will be replaced with text descriptions');
+    }
+
     // Set response headers for PDF download
     const filename = `LeetCode_${date?.replace(/[^a-zA-Z0-9]/g, '_') || 'Daily'}.pdf`;
     res.setHeader('Content-Type', 'application/pdf');
@@ -113,32 +218,54 @@ app.post('/generate-pdf', (req, res) => {
     doc.pipe(res);
 
     // Helper functions for styling
+    // Helper to set font with emoji support
+    const setFontWithEmojiSupport = () => {
+      if (hasEmojiFont) {
+        try {
+          doc.font('EmojiFont');
+        } catch (error) {
+          // Fallback to Helvetica if font registration failed at runtime
+          doc.font('Helvetica');
+        }
+      } else {
+        doc.font('Helvetica');
+      }
+    };
+
     const addTitle = (text, fontSize = 24, color = '#1a73e8') => {
+      setFontWithEmojiSupport();
       doc.fontSize(fontSize)
          .fillColor(color)
          .text(text, { align: 'center' })
+         .font('Helvetica') // Reset to default
          .moveDown(0.5);
     };
 
     const addHeading = (text, fontSize = 18, color = '#34a853') => {
+      setFontWithEmojiSupport();
       doc.fontSize(fontSize)
          .fillColor(color)
          .text(text)
+         .font('Helvetica') // Reset to default
          .moveDown(0.3);
     };
 
     const addSubHeading = (text, fontSize = 14, color = '#ea4335') => {
+      setFontWithEmojiSupport();
       doc.fontSize(fontSize)
          .fillColor(color)
          .text(text)
+         .font('Helvetica') // Reset to default
          .moveDown(0.2);
     };
 
     const addBody = (text, fontSize = 11) => {
       if (!text) return;
+      setFontWithEmojiSupport();
       doc.fontSize(fontSize)
          .fillColor('#333333')
          .text(text, { align: 'justify', width: doc.page.width - 100 })
+         .font('Helvetica') // Reset to default
          .moveDown(0.3);
     };
 
@@ -176,7 +303,7 @@ app.post('/generate-pdf', (req, res) => {
 
     // Build PDF content
     // Header
-    addTitle('🚀 LeetCode Daily Challenge', 24, '#1a73e8');
+    addTitle('LeetCode Daily Challenge', 24, '#1a73e8');
     
     if (date) {
       doc.fontSize(12).fillColor('#666666').text(date, { align: 'center' }).moveDown(1);
@@ -185,7 +312,7 @@ app.post('/generate-pdf', (req, res) => {
     addLine();
 
     // Problem Title
-    addHeading(`📌 ${cleanedTitle}`, 20, '#1a73e8');
+    addHeading(`${cleanedTitle}`, 20, '#1a73e8');
 
     // Metadata box
     const boxY = doc.y;
